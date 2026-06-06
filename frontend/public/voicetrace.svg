@@ -1,0 +1,10 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <!-- 简约音波 + 麦克风 线条图标 -->
+  <g stroke="#2563eb" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 麦克风 -->
+    <path d="M64 40V32M56 40H72M64 72V88M52 88H76" />
+    <circle cx="64" cy="48" r="8" />
+    <!-- 音波轨迹 Trace -->
+    <path d="M40 64C48 48 56 64 64 64C72 64 80 48 88 64" />
+  </g>
+</svg>
