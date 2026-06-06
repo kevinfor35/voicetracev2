@@ -10,5 +10,5 @@ wheels/
 .venv
 
 models/
-output/
+outputs/
 uploads/

@@ -2,6 +2,8 @@
 转录服务
 """
 import asyncio
+import shutil
+import tempfile
 from datetime import datetime
 from typing import Optional, List, Dict
 from pathlib import Path
@@ -9,6 +11,22 @@ from faster_whisper import WhisperModel
 from backend.app.models.schemas import TaskInfo, SubtitleSegment
 from backend.app.utils.config import MODELS_DIR, WHISPER_MODELS
 from backend.app.utils.helpers import generate_task_id
+
+try:
+    from huggingface_hub import snapshot_download
+    HAS_HF_HUB = True
+except ImportError:
+    HAS_HF_HUB = False
+
+
+# faster-whisper 模型所需的文件名列表
+MODEL_FILES = [
+    "model.bin",
+    "config.json",
+    "tokenizer.json",
+    "vocabulary.txt",
+    "preprocessor_config.json",
+]
 
 
 class TranscribeService:
@@ -127,7 +145,7 @@ class TranscribeService:
         加载 Whisper 模型
 
         Args:
-            model_name: 模型名称
+            model_name: 模型名称（tiny/base/small/medium/large）
             use_gpu: 是否使用 GPU
 
         Returns:
@@ -142,17 +160,120 @@ class TranscribeService:
         device = "cuda" if use_gpu else "cpu"
         compute_type = "float16" if use_gpu else "int8"
 
-        # 加载模型
+        # 查找模型路径（仅查找干净目录结构：models/model_name/）
+        model_path = self._find_model_path(model_name)
+
+        # 加载模型 - 传入的是本地目录路径，不会触发自动下载
         model = WhisperModel(
-            model_name,
+            model_path,
             device=device,
             compute_type=compute_type,
-            download_root=str(MODELS_DIR)
         )
 
         # 缓存模型
         self.model_cache[cache_key] = model
         return model
+
+    def _find_model_path(self, model_name: str) -> str:
+        """
+        查找模型路径（仅支持干净目录结构：models/model_name/）
+
+        优先级：
+        1. 已存在的干净目录 -> 直接返回
+        2. 不存在 -> 自动下载到干净目录后返回
+
+        Args:
+            model_name: 模型名称
+
+        Returns:
+            str: 模型目录路径（如 D:/project/models/tiny）
+        """
+        clean_model_path = MODELS_DIR / model_name
+
+        # 1. 如果干净目录已存在且包含必要文件，直接返回
+        if clean_model_path.exists() and self._has_model_files(clean_model_path):
+            return str(clean_model_path)
+
+        # 2. 否则自动下载模型到干净目录
+        if HAS_HF_HUB:
+            print(f"Model '{model_name}' not found locally. Downloading...")
+            self._download_model_to_clean_dir(model_name)
+            # 下载完成后再次检查
+            if clean_model_path.exists() and self._has_model_files(clean_model_path):
+                print(f"Model '{model_name}' downloaded successfully to {clean_model_path}")
+                return str(clean_model_path)
+            else:
+                print(f"Warning: Download completed but required files not found in {clean_model_path}")
+        else:
+            print("Warning: huggingface_hub not available, cannot auto-download model.")
+
+        # 3. 回退：返回模型名称字符串，让 faster-whisper 自行处理
+        return model_name
+
+    def _download_model_to_clean_dir(self, model_name: str):
+        """
+        将模型直接下载到干净目录结构（与官网手动下载格式一致）
+
+        目录结构：models/model_name/model.bin, config.json, ...
+
+        Args:
+            model_name: 模型名称
+        """
+        try:
+            repo_id = f"Systran/faster-whisper-{model_name}"
+            clean_model_path = MODELS_DIR / model_name
+
+            # 如果目录已存在但文件不完整，先删除
+            if clean_model_path.exists():
+                shutil.rmtree(clean_model_path)
+
+            # 创建干净目录
+            clean_model_path.mkdir(parents=True, exist_ok=True)
+
+            # 使用系统临时目录作为 HF 缓存（避免在 models/ 下生成 blobs/refs/snapshots）
+            with tempfile.TemporaryDirectory() as tmp_cache_dir:
+                # 使用 snapshot_download 直接下载到本地目录
+                # local_dir 参数指定文件的最终位置
+                # cache_dir 参数指向临时目录，避免污染 models/
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(clean_model_path),
+                    cache_dir=tmp_cache_dir,
+                    local_files_only=False,
+                )
+
+            # 清理 huggingface_hub 在 local_dir 中留下的 .cache/ 目录
+            cache_subdir = clean_model_path / ".cache"
+            if cache_subdir.exists():
+                shutil.rmtree(cache_subdir)
+
+            # 清理无关文件（可选保留）
+            # 保留 .gitattributes 不影响使用，但可以删除 README 等非必需文件
+            for filename in ["README.md"]:
+                f = clean_model_path / filename
+                if f.exists():
+                    f.unlink()
+
+        except Exception as e:
+            print(f"Failed to download model '{model_name}': {e}")
+            # 清理可能产生的空目录或不完整文件
+            if clean_model_path.exists():
+                shutil.rmtree(clean_model_path)
+
+    def _has_model_files(self, dir_path: Path) -> bool:
+        """
+        检查目录中是否包含模型所需的关键文件
+
+        Args:
+            dir_path: 目录路径
+
+        Returns:
+            bool: 是否包含必需的模型文件
+        """
+        # 至少需要 model.bin 和 config.json
+        has_model_bin = (dir_path / "model.bin").exists()
+        has_config = (dir_path / "config.json").exists()
+        return has_model_bin and has_config
 
     async def _transcribe(
         self,
@@ -214,8 +335,7 @@ class TranscribeService:
         model_config = WHISPER_MODELS[model_name]
 
         # 检查模型是否已下载
-        model_path = MODELS_DIR / f"model--guillaumekln--faster-whisper-{model_name}"
-        downloaded = model_path.exists()
+        downloaded = self._is_model_downloaded(model_name)
 
         return {
             "name": model_name,
@@ -223,6 +343,21 @@ class TranscribeService:
             "languages": model_config["languages"],
             "downloaded": downloaded
         }
+
+    def _is_model_downloaded(self, model_name: str) -> bool:
+        """
+        检查模型是否已下载（仅检查干净目录结构：models/model_name/）
+
+        Args:
+            model_name: 模型名称
+
+        Returns:
+            bool: 是否已下载
+        """
+        clean_model_path = MODELS_DIR / model_name
+        if clean_model_path.exists():
+            return self._has_model_files(clean_model_path)
+        return False
 
     def get_all_models(self) -> List[dict]:
         """
