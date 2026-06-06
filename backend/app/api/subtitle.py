@@ -63,16 +63,23 @@ async def download_subtitle(task_id: str):
     if task.status != "completed":
         raise HTTPException(status_code=400, detail=f"任务未完成，当前状态: {task.status}")
 
+    # 使用转录完成时自动保存的文件
+    if task.output_path and task.output_filename:
+        return FileResponse(
+            path=task.output_path,
+            filename=task.output_filename,
+            media_type="text/plain"
+        )
+
+    # 如果没有自动保存的文件，重新生成
     if not task.segments:
         raise HTTPException(status_code=404, detail="字幕结果不存在")
 
-    # 生成并保存 SRT 文件
     file_path, filename = subtitle_service.save_srt_file(
         task.segments,
         task.model
     )
 
-    # 返回文件
     return FileResponse(
         path=file_path,
         filename=filename,

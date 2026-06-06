@@ -4,6 +4,7 @@
 import asyncio
 import shutil
 import tempfile
+import os
 from datetime import datetime
 from typing import Optional, List, Dict
 from pathlib import Path
@@ -11,6 +12,7 @@ from faster_whisper import WhisperModel
 from backend.app.models.schemas import TaskInfo, SubtitleSegment
 from backend.app.utils.config import MODELS_DIR, WHISPER_MODELS
 from backend.app.utils.helpers import generate_task_id
+from backend.app.services.subtitle_service import subtitle_service
 
 try:
     from huggingface_hub import snapshot_download
@@ -90,9 +92,12 @@ class TranscribeService:
         """
         return self.tasks.get(task_id)
 
-    async def process_task(self, task_id: str):
+    def process_task(self, task_id: str):
         """
-        处理转录任务（异步执行）
+        处理转录任务（同步执行，在线程池中运行）
+
+        注意：使用同步方法（而非 async），让 FastAPI 的 BackgroundTasks 将其
+        放在线程池中执行，避免阻塞事件循环，确保状态轮询可以正常响应。
 
         Args:
             task_id: 任务 ID
@@ -114,8 +119,8 @@ class TranscribeService:
             task.current_step = "开始转录"
             task.progress = 20
 
-            # 执行转录
-            segments, info = await self._transcribe(
+            # 执行转录（同步，在线程池中运行）
+            segments, info = self._transcribe(
                 model,
                 task.file_path,
                 task.language
@@ -128,10 +133,23 @@ class TranscribeService:
             # 保存结果
             task.segments = segments
             task.detected_language = info.language
+
+            # 自动保存 SRT 文件到 outputs/ 目录
+            output_path, output_filename = subtitle_service.save_srt_file(segments, task.model)
+            task.output_path = output_path
+            task.output_filename = output_filename
+
             task.status = "completed"
             task.progress = 100
             task.current_step = "完成"
             task.complete_time = datetime.now()
+
+            # 删除上传的临时文件（不再需要保存）
+            if task.file_path and os.path.exists(task.file_path):
+                try:
+                    os.remove(task.file_path)
+                except Exception as e:
+                    print(f"Failed to delete uploaded file: {e}")
 
         except Exception as e:
             # 处理错误
@@ -139,6 +157,13 @@ class TranscribeService:
             task.error = str(e)
             task.current_step = "失败"
             task.complete_time = datetime.now()
+
+            # 清理上传的临时文件
+            if task.file_path and os.path.exists(task.file_path):
+                try:
+                    os.remove(task.file_path)
+                except Exception:
+                    pass
 
     def _load_model(self, model_name: str, use_gpu: bool) -> WhisperModel:
         """
@@ -275,14 +300,18 @@ class TranscribeService:
         has_config = (dir_path / "config.json").exists()
         return has_model_bin and has_config
 
-    async def _transcribe(
+    def _transcribe(
         self,
         model: WhisperModel,
         file_path: str,
         language: Optional[str]
     ) -> tuple[List[SubtitleSegment], any]:
         """
-        执行转录
+        执行转录（同步，在线程池中运行）
+
+        注意：faster_whisper 的 transcribe() 返回一个生成器，实际转录在遍历
+        segments 时发生。由于 process_task 整体在线程池中运行，这里可以直接
+        同步执行，不会阻塞主事件循环。
 
         Args:
             model: Whisper 模型
@@ -292,20 +321,16 @@ class TranscribeService:
         Returns:
             tuple: (字幕分段列表, 转录信息)
         """
-        # 在线程池中执行转录（避免阻塞）
-        loop = asyncio.get_event_loop()
-        segments, info = await loop.run_in_executor(
-            None,
-            lambda: model.transcribe(
-                file_path,
-                language=language,
-                task="transcribe",
-                beam_size=5,
-                vad_filter=True
-            )
+        # 执行转录
+        segments, info = model.transcribe(
+            file_path,
+            language=language,
+            task="transcribe",
+            beam_size=5,
+            vad_filter=True
         )
 
-        # 转换为字幕分段格式
+        # 遍历生成器，消耗所有转录结果并转换为字幕分段格式
         subtitle_segments = []
         for i, segment in enumerate(segments, start=1):
             subtitle_segments.append(
