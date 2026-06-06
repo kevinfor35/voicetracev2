@@ -236,7 +236,7 @@ A: **不能直接用。faster-whisper 不支持 .safetensors 格式。** 解决�
 ### Q: distil-large-v3 和 large-v3-turbo 有什么区别？
 A: 关键区别在于**语言支持**：
 - `distil-large-v3`：**仅支持英语**（蒸馏版本，已删除多语言能力）
-- `large-v3-turbo`：**支持 99 种语言**（推荐用于中文/韩文等多语言场景）
+- `large-v3-turbo`：**支持多语言**（推荐用于中文/韩文等多语言场景）
 
 两者速度接近，但 large-v3-turbo 支持多语言，是真正的性价比之王。
 
