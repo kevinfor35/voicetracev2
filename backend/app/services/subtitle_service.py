@@ -3,7 +3,7 @@
 """
 from pathlib import Path
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 from backend.app.models.schemas import SubtitleSegment
 from backend.app.utils.config import OUTPUTS_DIR
 from backend.app.utils.helpers import format_timestamp, generate_output_filename
@@ -41,7 +41,8 @@ class SubtitleService:
     @staticmethod
     def save_srt_file(
         segments: List[SubtitleSegment],
-        model: str
+        model: str,
+        inference_time: Optional[float] = None
     ) -> tuple[str, str]:
         """
         保存 SRT 字幕文件
@@ -49,12 +50,13 @@ class SubtitleService:
         Args:
             segments: 字幕分段列表
             model: 模型名称
+            inference_time: 推理时间（秒），如果提供则加入文件名
 
         Returns:
             tuple: (文件路径, 文件名)
         """
-        # 生成文件名
-        filename = generate_output_filename(model)
+        # 生成文件名（包含推理时间）
+        filename = generate_output_filename(model, inference_time)
         file_path = OUTPUTS_DIR / filename
 
         # 生成 SRT 内容

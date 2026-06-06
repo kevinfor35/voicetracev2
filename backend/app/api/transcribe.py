@@ -47,14 +47,13 @@ async def start_transcribe(
 
     file_info = uploaded_files[request.file_id]
 
-    # 创建转录任务
+    # 创建转录任务（CPU 推理，无需 GPU 参数）
     task_id = transcribe_service.create_task(
         file_id=request.file_id,
         file_path=file_info["file_path"],
         filename=file_info["filename"],
         model=request.model,
-        language=request.language,
-        use_gpu=request.use_gpu
+        language=request.language
     )
 
     # 在后台执行转录任务

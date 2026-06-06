@@ -21,7 +21,6 @@ const Home: React.FC = () => {
   const [config, setConfig] = useState<Config>({
     model: 'base',
     language: 'auto',
-    useGpu: false,
   });
   const [taskId, setTaskId] = useState<string | null>(null);
   const [status, setStatus] = useState<StatusResponse | null>(null);
@@ -91,7 +90,6 @@ const Home: React.FC = () => {
         file_id: uploadResponse.file_id,
         model: config.model,
         language: config.language === 'auto' ? undefined : config.language,
-        use_gpu: config.useGpu,
       });
 
       setTaskId(transcribeResponse.task_id);

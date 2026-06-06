@@ -1,10 +1,18 @@
 """
 转录服务
+
+核心功能：
+1. 支持 80 维和 128 维梅尔频谱模型（通过 preprocessor_config.json 检测）
+2. 自动在 config.json 中添加 num_mel_bins 字段，确保 faster-whisper 正确识别
+3. 优化多语言支持和 VAD filter 参数
+4. 统计推理时间并在输出文件名中体现
 """
 import asyncio
 import shutil
 import tempfile
 import os
+import json
+import time
 from datetime import datetime
 from typing import Optional, List, Dict
 from pathlib import Path
@@ -46,8 +54,7 @@ class TranscribeService:
         file_path: str,
         filename: str,
         model: str,
-        language: Optional[str],
-        use_gpu: bool
+        language: Optional[str]
     ) -> str:
         """
         创建转录任务
@@ -58,7 +65,6 @@ class TranscribeService:
             filename: 文件名
             model: 模型名称
             language: 语言代码
-            use_gpu: 是否使用 GPU
 
         Returns:
             str: 任务 ID
@@ -71,7 +77,6 @@ class TranscribeService:
             filename=filename,
             model=model,
             language=language,
-            use_gpu=use_gpu,
             status="pending",
             progress=0,
             current_step="等待处理",
@@ -106,25 +111,35 @@ class TranscribeService:
         if not task:
             return
 
+        # 记录总处理开始时间
+        total_start_time = time.time()
+
         try:
             # 更新任务状态
             task.status = "processing"
             task.current_step = "加载模型"
             task.progress = 10
 
-            # 加载模型
-            model = self._load_model(task.model, task.use_gpu)
+            # 加载模型（CPU 推理）
+            model = self._load_model(task.model)
+
+            # 记录推理开始时间
+            inference_start_time = time.time()
 
             # 更新进度
             task.current_step = "开始转录"
             task.progress = 20
 
-            # 执行转录（同步，在线程池中运行）
+            # 执行转录
             segments, info = self._transcribe(
                 model,
                 task.file_path,
                 task.language
             )
+
+            # 计算推理时间
+            inference_time = time.time() - inference_start_time
+            total_time = time.time() - total_start_time
 
             # 更新进度
             task.current_step = "处理结果"
@@ -134,8 +149,10 @@ class TranscribeService:
             task.segments = segments
             task.detected_language = info.language
 
-            # 自动保存 SRT 文件到 outputs/ 目录
-            output_path, output_filename = subtitle_service.save_srt_file(segments, task.model)
+            # 自动保存 SRT 文件到 outputs/ 目录（包含推理时间）
+            output_path, output_filename = subtitle_service.save_srt_file(
+                segments, task.model, inference_time
+            )
             task.output_path = output_path
             task.output_filename = output_filename
 
@@ -143,6 +160,8 @@ class TranscribeService:
             task.progress = 100
             task.current_step = "完成"
             task.complete_time = datetime.now()
+
+            print(f"Task {task_id} completed: inference={inference_time:.1f}s, total={total_time:.1f}s")
 
             # 删除上传的临时文件（不再需要保存）
             if task.file_path and os.path.exists(task.file_path):
@@ -157,6 +176,7 @@ class TranscribeService:
             task.error = str(e)
             task.current_step = "失败"
             task.complete_time = datetime.now()
+            print(f"Task {task_id} failed: {e}")
 
             # 清理上传的临时文件
             if task.file_path and os.path.exists(task.file_path):
@@ -165,39 +185,96 @@ class TranscribeService:
                 except Exception:
                     pass
 
-    def _load_model(self, model_name: str, use_gpu: bool) -> WhisperModel:
+    def _load_model(self, model_name: str) -> WhisperModel:
         """
-        加载 Whisper 模型
+        加载 Whisper 模型（CPU 推理）
 
         Args:
-            model_name: 模型名称（tiny/base/small/medium/large）
-            use_gpu: 是否使用 GPU
+            model_name: 模型名称
 
         Returns:
             WhisperModel: 加载的模型
         """
         # 检查模型缓存
-        cache_key = f"{model_name}_{use_gpu}"
+        cache_key = model_name
         if cache_key in self.model_cache:
             return self.model_cache[cache_key]
 
-        # 设置设备
-        device = "cuda" if use_gpu else "cpu"
-        compute_type = "float16" if use_gpu else "int8"
+        # 固定使用 CPU 推理，compute_type 为 int8（量化，省内存）
+        device = "cpu"
+        compute_type = "int8"
 
-        # 查找模型路径（仅查找干净目录结构：models/model_name/）
+        # 查找模型路径
         model_path = self._find_model_path(model_name)
 
-        # 加载模型 - 传入的是本地目录路径，不会触发自动下载
+        # 关键：确保 config.json 中有正确的 num_mel_bins 字段
+        self._ensure_num_mel_bins(model_path)
+
+        # 加载模型
         model = WhisperModel(
             model_path,
             device=device,
             compute_type=compute_type,
+            local_files_only=True,
         )
 
         # 缓存模型
         self.model_cache[cache_key] = model
         return model
+
+    def _ensure_num_mel_bins(self, model_path: str):
+        """
+        确保 config.json 中有正确的 num_mel_bins 字段
+        
+        标准 Whisper 模型 (tiny/base/small/medium) 使用 80 维梅尔频谱
+        large-v3 和 distil 模型使用 128 维梅尔频谱
+        
+        检测逻辑：
+        1. 如果 preprocessor_config.json 存在，读取其中的 feature_size
+        2. 如果 config.json 中没有 num_mel_bins，添加正确的值
+        3. 如果两个文件都不存在，使用默认 80
+
+        Args:
+            model_path: 模型目录路径
+        """
+        config_path = Path(model_path) / "config.json"
+        preproc_path = Path(model_path) / "preprocessor_config.json"
+        
+        if not config_path.exists():
+            return  # 无 config.json 则跳过
+
+        # 读取当前 config.json
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except Exception as e:
+            print(f"Warning: Could not read config.json at {config_path}: {e}")
+            return
+
+        # 如果已经有 num_mel_bins，则不需要修改
+        if "num_mel_bins" in config:
+            return
+
+        # 从 preprocessor_config.json 读取 feature_size
+        detected_mel_bins = 80  # 默认值
+        if preproc_path.exists():
+            try:
+                with open(preproc_path, 'r', encoding='utf-8') as f:
+                    preproc = json.load(f)
+                feature_size = preproc.get("feature_size", 80)
+                detected_mel_bins = int(feature_size)
+            except Exception as e:
+                print(f"Warning: Could not read preprocessor_config.json at {preproc_path}: {e}")
+
+        # 添加 num_mel_bins 到 config.json
+        config["num_mel_bins"] = detected_mel_bins
+        
+        try:
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            print(f"Updated {config_path.name}: num_mel_bins = {detected_mel_bins}")
+        except Exception as e:
+            print(f"Warning: Could not write config.json at {config_path}: {e}")
 
     def _find_model_path(self, model_name: str) -> str:
         """
@@ -235,6 +312,34 @@ class TranscribeService:
         # 3. 回退：返回模型名称字符串，让 faster-whisper 自行处理
         return model_name
 
+    def _get_repo_id(self, model_name: str) -> str:
+        """
+        根据模型名称获取正确的 HuggingFace repo_id
+
+        Args:
+            model_name: 模型名称
+
+        Returns:
+            str: HuggingFace repo_id
+        """
+        # Distil 模型使用不同的命名格式（仅支持英语）
+        if model_name == "distil-large-v3.5":
+            # 特殊处理：distil-large-v3.5 使用不同的 repo（官方 CTranslate2 版本）
+            return "distil-whisper/distil-large-v3.5-ct2"
+        elif model_name.startswith("distil-"):
+            # distil-large-v2 -> Systran/faster-distil-whisper-large-v2
+            model_suffix = model_name.replace("distil-", "")
+            return f"Systran/faster-distil-whisper-{model_suffix}"
+
+        # Turbo 模型：必须使用 CTranslate2 格式的预转换仓库
+        # 注意：openai/whisper-large-v3-turbo 是 .safetensors 格式，faster-whisper 不支持！
+        # 必须使用已转换为 CTranslate2 格式的仓库（model.bin 而非 model.safetensors）
+        if model_name == "large-v3-turbo":
+            return "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+
+        # 其他模型使用标准格式
+        return f"Systran/faster-whisper-{model_name}"
+
     def _download_model_to_clean_dir(self, model_name: str):
         """
         将模型直接下载到干净目录结构（与官网手动下载格式一致）
@@ -245,7 +350,8 @@ class TranscribeService:
             model_name: 模型名称
         """
         try:
-            repo_id = f"Systran/faster-whisper-{model_name}"
+            # 根据模型名称确定正确的 HuggingFace repo_id
+            repo_id = self._get_repo_id(model_name)
             clean_model_path = MODELS_DIR / model_name
 
             # 如果目录已存在但文件不完整，先删除
@@ -298,6 +404,14 @@ class TranscribeService:
         # 至少需要 model.bin 和 config.json
         has_model_bin = (dir_path / "model.bin").exists()
         has_config = (dir_path / "config.json").exists()
+
+        # 可选：检查文件大小，确保 model.bin 不是空文件或损坏文件
+        if has_model_bin:
+            model_bin_size = (dir_path / "model.bin").stat().st_size
+            if model_bin_size < 1024 * 1024:  # 小于 1MB 可能是损坏的
+                print(f"Warning: model.bin in {dir_path} is too small ({model_bin_size} bytes), may be corrupted")
+                return False
+
         return has_model_bin and has_config
 
     def _transcribe(
@@ -309,9 +423,13 @@ class TranscribeService:
         """
         执行转录（同步，在线程池中运行）
 
-        注意：faster_whisper 的 transcribe() 返回一个生成器，实际转录在遍历
-        segments 时发生。由于 process_task 整体在线程池中运行，这里可以直接
-        同步执行，不会阻塞主事件循环。
+        语言参数处理：
+        - "auto" 或 None -> 传 None 给 faster-whisper，让其自动检测语言
+        - 其他值如 "zh", "en", "ko" -> 强制指定语言
+
+        VAD 参数：
+        - 使用宽松的 VAD 配置，min_silence_duration_ms 设为 2000ms
+        - 避免过度切分音频导致漏识别
 
         Args:
             model: Whisper 模型
@@ -321,13 +439,23 @@ class TranscribeService:
         Returns:
             tuple: (字幕分段列表, 转录信息)
         """
+        # 处理语言参数：'auto' -> None（自动检测），其他保持原值
+        whisper_language = None if (language is None or language == 'auto') else language
+
         # 执行转录
+        # VAD 参数优化：
+        # - min_silence_duration_ms: 静音检测阈值，越大越宽松
+        # - speech_pad_ms: 语音段前后填充，避免切分过碎
         segments, info = model.transcribe(
             file_path,
-            language=language,
+            language=whisper_language,
             task="transcribe",
             beam_size=5,
-            vad_filter=True
+            vad_filter=True,
+            vad_parameters=dict(
+                min_silence_duration_ms=2000,  # 2秒静音才视为静音段
+                speech_pad_ms=400,              # 语音段前后各填充 400ms
+            ),
         )
 
         # 遍历生成器，消耗所有转录结果并转换为字幕分段格式

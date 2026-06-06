@@ -147,7 +147,6 @@ export interface TranscribeRequest {
   file_id: string;
   model: string;
   language?: string;
-  use_gpu: boolean;
 }
 
 export interface TranscribeResponse {

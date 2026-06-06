@@ -75,31 +75,30 @@ def is_supported_format(filename: str) -> bool:
     return ext in SUPPORTED_FORMATS
 
 
-def generate_output_filename(model: str) -> str:
+def generate_output_filename(model: str, inference_time: Optional[float] = None) -> str:
     """
     生成输出文件名
-    格式: {model}_{YYYYMMDD_HHMMSS}.srt
+
+    格式:
+    - 无推理时间: {model}_{YYYYMMDD_HHMMSS}.srt
+    - 有推理时间: {model}_{YYYYMMDD_HHMMSS}_{inference_time}s.srt
+
+    Args:
+        model: 模型名称
+        inference_time: 推理时间（秒）
+
+    Returns:
+        str: 文件名
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{model}_{timestamp}.srt"
 
-
-def check_gpu_available() -> bool:
-    """检查 GPU 是否可用"""
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except ImportError:
-        # 如果 torch 未安装，尝试检查 CUDA 环境
-        try:
-            result = subprocess.run(
-                ["nvidia-smi"],
-                capture_output=True,
-                timeout=5
-            )
-            return result.returncode == 0
-        except Exception:
-            return False
+    if inference_time is not None and inference_time > 0:
+        # 格式化为 MM:SS 格式
+        minutes = int(inference_time // 60)
+        seconds = int(inference_time % 60)
+        return f"{model}_{timestamp}_{minutes:02d}m{seconds:02d}s.srt"
+    else:
+        return f"{model}_{timestamp}.srt"
 
 
 def cleanup_old_files(directory: Path, max_age_hours: int = 24):
